@@ -82,6 +82,8 @@ static ringbuf_t console_rx_buffer, console_tx_buffer;
 
 static ip_addr_t my_ip;
 static ip_addr_t dns_ip;
+static bool extender;
+
 bool connected;
 uint8_t my_channel;
 bool do_ip_config;
@@ -91,6 +93,7 @@ uint8_t uplink_bssid[6];
 
 static netif_input_fn orig_input_ap, orig_input_sta;
 static netif_linkoutput_fn orig_output_ap, orig_output_sta;
+
 
 uint8_t remote_console_disconnect;
 struct espconn *currentconn;
@@ -225,7 +228,8 @@ void ICACHE_FLASH_ATTR user_ping_recv(void *arg, void *pdata)
         os_sprintf(response, "ping recv bytes: %d time: %d ms\r\n",ping_resp->bytes,ping_resp->resp_time);
 	ping_success_count++;
     }
-
+    if (ping_success_count >0)
+      ap_watchdog_cnt = config.ap_watchdog;
     to_console(response);
     system_os_post(0, SIG_CONSOLE_TX_RAW, (ETSParam) currentconn);
 }
@@ -241,6 +245,8 @@ void ICACHE_FLASH_ATTR user_ping_sent(void *arg, void *pdata)
 
 void ICACHE_FLASH_ATTR user_do_ping(uint32_t ipaddr)
 {
+    char response[128];
+  
     ping_opt.count = 4;    //  try to ping how many times
     ping_opt.coarse_time = 2;  // ping interval
     ping_opt.ip = ipaddr;
@@ -248,7 +254,7 @@ void ICACHE_FLASH_ATTR user_do_ping(uint32_t ipaddr)
 
     ping_regist_recv(&ping_opt,user_ping_recv);
     ping_regist_sent(&ping_opt,user_ping_sent);
-
+    to_console(response);
     ping_start(&ping_opt);
 }
 #endif
@@ -427,7 +433,7 @@ err_t ICACHE_FLASH_ATTR my_input_ap (struct pbuf *p, struct netif *inp) {
        if (put_packet_to_ringbuf(p) != 0) {
 #ifdef DROP_PACKET_IF_NOT_RECORDED
                pbuf_free(p);
-	       return ERR_OK;
+	       return;
 #endif
        }
        if (!monitoring_send_ongoing)
@@ -447,7 +453,7 @@ err_t ICACHE_FLASH_ATTR my_input_ap (struct pbuf *p, struct netif *inp) {
     // If not allowed, drop packet
     if (!(acl_check&ACL_ALLOW)) {
 	pbuf_free(p);
-	return ERR_OK;
+	return;
     };
 #endif
 
@@ -457,7 +463,7 @@ err_t ICACHE_FLASH_ATTR my_input_ap (struct pbuf *p, struct netif *inp) {
 	    token_bucket_us -= p->tot_len;
         } else {
 	    pbuf_free(p);
-	    return ERR_OK;
+	    return;
 	}
     }
 #endif
@@ -465,7 +471,7 @@ err_t ICACHE_FLASH_ATTR my_input_ap (struct pbuf *p, struct netif *inp) {
     Bytes_in += p->tot_len;
     Packets_in++;
 
-    return orig_input_ap (p, inp);
+    orig_input_ap (p, inp);
 }
 
 err_t ICACHE_FLASH_ATTR my_output_ap (struct netif *outp, struct pbuf *p) {
@@ -487,7 +493,7 @@ err_t ICACHE_FLASH_ATTR my_output_ap (struct netif *outp, struct pbuf *p) {
        if (put_packet_to_ringbuf(p) != 0) {
 #ifdef DROP_PACKET_IF_NOT_RECORDED
                pbuf_free(p);
-	       return ERR_OK;
+	       return;
 #endif
        }
        if (!monitoring_send_ongoing)
@@ -508,7 +514,7 @@ err_t ICACHE_FLASH_ATTR my_output_ap (struct netif *outp, struct pbuf *p) {
     // If not allowed, drop packet
     if (!(acl_check&ACL_ALLOW)) {
 	pbuf_free(p);
-	return ERR_OK;
+	return;
     };
 #endif
 
@@ -518,7 +524,7 @@ err_t ICACHE_FLASH_ATTR my_output_ap (struct netif *outp, struct pbuf *p) {
 	    token_bucket_ds -= p->tot_len;
         } else {
 	    pbuf_free(p);
-	    return ERR_OK;
+	    return;
 	}
     }
 #endif
@@ -526,8 +532,9 @@ err_t ICACHE_FLASH_ATTR my_output_ap (struct netif *outp, struct pbuf *p) {
     Bytes_out += p->tot_len;
     Packets_out++;
 
-    return orig_output_ap (outp, p);
+    orig_output_ap (outp, p);
 }
+
 
 err_t ICACHE_FLASH_ATTR my_input_sta (struct pbuf *p, struct netif *inp) {
 
@@ -535,30 +542,50 @@ err_t ICACHE_FLASH_ATTR my_input_sta (struct pbuf *p, struct netif *inp) {
 #ifdef ACLS
     if (!acl_is_empty(2) && !(acl_check_packet(2, p) & ACL_ALLOW)) {
 	pbuf_free(p);
-	return ERR_OK;
+	return;
     };
 #endif
-    return orig_input_sta (p, inp);
+    orig_input_sta (p, inp);
 }
 
 err_t ICACHE_FLASH_ATTR my_output_sta (struct netif *outp, struct pbuf *p) {
 #ifdef ACLS
     if (!acl_is_empty(3) && !(acl_check_packet(3, p) & ACL_ALLOW)) {
 	pbuf_free(p);
-	return ERR_OK;
+	return;
     };
 #endif
-    return orig_output_sta (outp, p);
+    orig_output_sta (outp, p);
 }
-
-static void ICACHE_FLASH_ATTR patch_netif(ip_addr_t netif_ip, netif_input_fn ifn, netif_input_fn *orig_ifn, netif_linkoutput_fn ofn, netif_linkoutput_fn *orig_ofn, bool nat)
+static void ICACHE_FLASH_ATTR patch_netif(ip_addr_t netif_ip, netif_input_fn ifn, netif_input_fn *orig_ifn, netif_linkoutput_fn ofn, netif_linkoutput_fn *orig_ofn, bool nat, bool extender)
 {	
 struct netif *nif;
-	
-	for (nif = netif_list; nif != NULL && nif->ip_addr.addr != netif_ip.addr; nif = nif->next);
+ip_addr_t netmask;
+	IP4_ADDR(&netmask, 255, 255, 255, 0);
+	bool found = false;
+	bool nat1 = nat;
+	for (nif = netif_list; nif != NULL && !found; nif = nif->next) {
+	  found = (nif->ip_addr.addr == netif_ip.addr);
+          if (extender) {
+	    if (nat){
+	      etharp_cleanup_netif(nif);
+	      found = (netif_ip.addr == nif->gw.addr);	      
+	      os_printf( "ip compare %x %x %x \r\n", netif_ip.addr, nif->gw.addr, nat );
+	    }
+	    else {
+	      found = !(netif_ip.addr == nif->gw.addr);
+	      os_printf( "ip compare %x %x %x %x\r\n", netif_ip.addr, nif->gw.addr, nat, found );	      
+	    }
+	  }
+	  if  (found) break;
+	}
 	if (nif == NULL) return;
-
-	nif->napt = nat?1:0;
+	if (extender) {
+	  nat1 = false; 
+	}
+	  os_printf( "relink interface \r\n", netif_ip.addr, nif->gw.addr, nat );
+	
+	nif->napt = nat1?1:0;
 	if (ifn != NULL && nif->input != ifn) {
 	  *orig_ifn = nif->input;
 	  nif->input = ifn;
@@ -2411,6 +2438,9 @@ uint32_t Bps;
     // Check if watchdogs
     if (toggle){
 	if (ap_watchdog_cnt >= 0) {
+	    if (ap_watchdog_cnt == 15) {
+	       user_do_ping(0x8080808);	      
+	    }
 	    if (ap_watchdog_cnt == 0) {
 		os_printf("AP watchdog reset\r\n");
 		system_restart();
@@ -2426,23 +2456,6 @@ uint32_t Bps;
 	    client_watchdog_cnt--;
 	}
     } 
-
-#ifdef FACTORY_RESET_PIN    
-    static count_pin;
-    bool pin_in = easygpio_inputGet(FACTORY_RESET_PIN);
-    if (!pin_in) {
-	count_pin++;
-	if (count_pin > 4) {
-	    os_printf("Factory reset pressed\r\n");
-	    config_load_default(&config);
-	    config_save(&config);
-	    blob_zero(0, sizeof(struct portmap_table) * IP_PORTMAP_MAX);
-	    system_restart();
-	}
-    } else {
-	count_pin = 0;
-    }
-#endif
 
     if (config.status_led <= 16)
 	easygpio_outputSet (config.status_led, toggle && connected);
@@ -2689,9 +2702,11 @@ void wifi_handle_event_cb(System_Event_t *evt)
         os_printf("ip:" IPSTR ",mask:" IPSTR ",gw:" IPSTR ",dns:" IPSTR "\n", IP2STR(&evt->event_info.got_ip.ip), IP2STR(&evt->event_info.got_ip.mask), IP2STR(&evt->event_info.got_ip.gw), IP2STR(&dns_ip));
 
 	my_ip = evt->event_info.got_ip.ip;
+	ip_addr_t my_network = my_ip;
+	ip4_addr4(&my_network) = 0;	
 	connected = true;
-
-	patch_netif(my_ip, my_input_sta, &orig_input_sta, my_output_sta, &orig_output_sta, false);
+        extender = (my_network.addr == config.network_addr.addr);
+	patch_netif(my_ip, my_input_sta, &orig_input_sta, my_output_sta, &orig_output_sta, false, extender);
 
 	// Update any predefined portmaps to the new IP addr
         for (i = 0; i<IP_PORTMAP_MAX; i++) {
@@ -2724,13 +2739,19 @@ void wifi_handle_event_cb(System_Event_t *evt)
 	mqtt_publish_str(MQTT_TOPIC_JOIN, "join", mac_str);
 #endif
 	ip_addr_t ap_ip = config.network_addr;
-	ip4_addr4(&ap_ip) = 1;
-	patch_netif(ap_ip, my_input_ap, &orig_input_ap, my_output_ap, &orig_output_ap, config.nat_enable);
+	ip4_addr4(&ap_ip) = 5;
+	if (extender)
+	    ap_ip=my_ip;
+	patch_netif(ap_ip, my_input_ap, &orig_input_ap, my_output_ap, &orig_output_ap, config.nat_enable, extender);
         break;
 
     case EVENT_SOFTAPMODE_STADISCONNECTED:
 	os_sprintf(mac_str, MACSTR, MAC2STR(evt->event_info.sta_disconnected.mac));
         os_printf("station: %s leave, AID = %d\r\n", mac_str, evt->event_info.sta_disconnected.aid);
+	struct netif* nif;
+	for (nif = netif_list; nif != NULL; nif = nif->next) 
+	   etharp_cleanup_netif(nif);
+	ap_watchdog_cnt = 20;
 #ifdef MQTT_CLIENT
 	mqtt_publish_str(MQTT_TOPIC_LEAVE, "leave", mac_str);
 #endif
@@ -2785,16 +2806,19 @@ int i;
    wifi_softap_dhcps_stop();
 
    info.ip = config.network_addr;
+   
    ip4_addr4(&info.ip) = 1;
+   if (extender)
+     info.ip=my_ip;
    info.gw = info.ip;
    IP4_ADDR(&info.netmask, 255, 255, 255, 0);
 
    wifi_set_ip_info(nif->num, &info);
 
    dhcp_lease.start_ip = config.network_addr;
-   ip4_addr4(&dhcp_lease.start_ip) = 2;
+   ip4_addr4(&dhcp_lease.start_ip) = 16;
    dhcp_lease.end_ip = config.network_addr;
-   ip4_addr4(&dhcp_lease.end_ip) = 128;
+   ip4_addr4(&dhcp_lease.end_ip) = 24;
    wifi_softap_set_dhcps_lease(&dhcp_lease);
 
    wifi_softap_dhcps_start();
@@ -3041,10 +3065,6 @@ struct ip_info info;
 	easygpio_pinMode(config.status_led, EASYGPIO_NOPULL, EASYGPIO_OUTPUT);
 	easygpio_outputSet (config.status_led, 0);
     }
-
-#ifdef FACTORY_RESET_PIN
-    easygpio_pinMode(FACTORY_RESET_PIN, EASYGPIO_PULLUP, EASYGPIO_INPUT);
-#endif
 
 #ifdef MQTT_CLIENT
 #ifdef USER_GPIO_IN
